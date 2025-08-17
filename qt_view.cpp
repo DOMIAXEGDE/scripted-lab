@@ -24,6 +24,7 @@
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QFileDialog>
+#include <QtWidgets/QInputDialog>
 #include <QtGui/QStandardItemModel>
 #include <QtGui/QClipboard>
 #include <QtCore/QMetaObject>
