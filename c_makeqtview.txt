@@ -1,0 +1,19 @@
+cmake_minimum_required(VERSION 3.22)
+project(scripted_gui_qt LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
+
+add_executable(scripted_gui_qt
+  qt_view.cpp
+)
+
+# Your shared headers live beside the sources; adjust include dirs if needed.
+target_include_directories(scripted_gui_qt PRIVATE ${CMAKE_SOURCE_DIR})
+
+target_link_libraries(scripted_gui_qt PRIVATE Qt6::Widgets)
+
+# Link your core if it’s a target; otherwise the headers are header-only.
+# target_link_libraries(scripted_gui_qt PRIVATE scripted_core)

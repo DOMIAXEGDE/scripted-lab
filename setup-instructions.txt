@@ -1,0 +1,289 @@
+Great—functionality-first, minimal deltas, and WSL-ready. Here’s a **tight, copy/paste build plan** that keeps your existing code untouched and only **adds** what’s needed to run C/C++/Java/Python “in-world” from Qt.
+
+---
+
+# 0) Prereqs (WSL Ubuntu)
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config cmake ninja-build \
+  qt6-base-dev qt6-base-dev-tools libgl1-mesa-dev \
+  openjdk-17-jdk python3 python3-venv python3-pip
+# optional: speed up builds
+sudo apt install -y ccache
+```
+
+Environment overrides (optional):
+
+```bash
+echo 'export SC_GCC=gcc SC_GXX=g++ SC_JAVAC=javac SC_JAVA=java SC_PYTHON=python3' >> ~/.bashrc
+source ~/.bashrc
+```
+
+---
+
+# 1) Drop in the exec module
+
+Save these files into your repo (top-level is fine):
+
+* `scripted_exec.hpp` → **download**: [scripted\_exec.hpp](sandbox:/mnt/data/scripted_exec.hpp)
+* (optional docs/examples)
+
+  * [EXEC\_ADDON\_README.md](sandbox:/mnt/data/EXEC_ADDON_README.md)
+  * [examples/echo.py](sandbox:/mnt/data/examples/echo.py)
+  * [examples/echo.cpp](sandbox:/mnt/data/examples/echo.cpp)
+  * [examples/echo.java](sandbox:/mnt/data/examples/echo.java)
+  * [examples/echo.c](sandbox:/mnt/data/examples/echo.c)
+
+> This header is standalone and safe: it refuses to run any code that lacks a valid `/*---DOC--- ... ---END---*/` block, and it compiles/execs via stdio-JSON so all languages share one I/O contract.
+
+---
+
+# 2) Minimal Qt wiring (3 tiny edits)
+
+## 2.1 Add two callbacks + a display hook to your view contract
+
+In `frontend_contract.hpp`, add:
+
+```cpp
+// new callbacks (non-breaking)
+std::function<void(long long,long long,const std::string&)> onRunCode; // reg, addr, stdin.json
+std::function<void(long long,long long)>                   onDocCheck; // reg, addr
+
+// new hook: presenter -> view
+virtual void showExecResult(const std::string& title,
+                            const std::string& stdout_json,
+                            const std::string& stderr_text,
+                            int exit_code,
+                            const std::filesystem::path& workdir) = 0;
+```
+
+## 2.2 Presenter: async run/doc-check
+
+In `presenter.hpp`:
+
+```cpp
+#include "scripted_exec.hpp"   // ADD at top
+
+// inside wire():
+view.onRunCode = [this](long long r,long long a,const std::string& in){ runCodeAsync(r,a,in); };
+view.onDocCheck = [this](long long r,long long a){ docCheckAsync(r,a); };
+
+// add methods:
+void runCodeAsync(long long reg,long long addr,const std::string& stdin_json);
+void docCheckAsync(long long reg,long long addr);
+```
+
+**Implement** (copy the pattern you already use for resolve/export):
+
+```cpp
+void Presenter::runCodeAsync(long long reg,long long addr,const std::string& stdin_json){
+    if (!current){ view.showStatus("No current context"); return; }
+    if (busy.exchange(true)){ view.showStatus("Busy."); return; }
+    view.setBusy(true);
+    auto id = *current;
+    std::thread([this,id,reg,addr,stdin_json](){
+        int exitc=-1; std::string out, err, status; std::filesystem::path workdir;
+        try {
+            auto &b = ws.banks[id];
+            auto itR=b.regs.find(reg);
+            if (itR==b.regs.end() || !itR->second.count(addr)) throw std::runtime_error("No such cell.");
+            std::unordered_set<std::string> visited;
+            Resolver R(cfg, ws);
+            std::string expanded = R.resolve(itR->second[addr], id, visited); // resolves @file and xBANK.ADDR
+            scripted_exec::ExecManager EM; // files/out/exec/...
+            auto res = EM.build_and_run(expanded, stdin_json);
+            exitc=res.exit_code; out=res.stdout_json; err=res.stderr_text; workdir=res.workdir;
+            status="exit="+std::to_string(exitc)+" ("+workdir.string()+")";
+        } catch (const std::exception& e) { err=e.what(); }
+        view.postToUi([this,exitc,out,err,status,workdir](){
+            view.setBusy(false); busy=false;
+            view.showStatus(status);
+            view.showExecResult("In-world exec", out, err, exitc, workdir);
+        });
+    }).detach();
+}
+
+void Presenter::docCheckAsync(long long reg,long long addr){
+    if (!current){ view.showStatus("No current context"); return; }
+    if (busy.exchange(true)){ view.showStatus("Busy."); return; }
+    view.setBusy(true);
+    auto id = *current;
+    std::thread([this,id,reg,addr](){
+        std::string report=""; int exitc=0;
+        try{
+            auto &b=ws.banks[id]; auto itR=b.regs.find(reg);
+            if (itR==b.regs.end() || !itR->second.count(addr)) throw std::runtime_error("No such cell.");
+            std::unordered_set<std::string> visited;
+            Resolver R(cfg, ws);
+            std::string expanded = R.resolve(itR->second[addr], id, visited);
+            auto doc = scripted_exec::extract_doc_block(expanded);
+            if (!doc) { exitc=1; report="Missing /*---DOC--- ... ---END---*/"; }
+            else report=*doc;
+        } catch (const std::exception& e){ exitc=1; report=e.what(); }
+        view.postToUi([this,exitc,report](){
+            view.setBusy(false); busy=false;
+            view.showExecResult("Doc check", report, "", exitc, {});
+        });
+    }).detach();
+}
+```
+
+## 2.3 Qt view: menu + output pane
+
+In `qt_view.cpp`:
+
+* **Menu** (add to your menubar construction):
+
+```cpp
+auto code = mbar->addMenu("&Code");
+auto actRun = code->addAction("&Run (stdio-json)…\tCtrl+Enter");
+actRun->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return));
+connect(actRun, &QAction::triggered, this, [this]{ runSelected(); });
+
+auto actDoc = code->addAction("&Doc check");
+connect(actDoc, &QAction::triggered, this, [this]{ docCheckSelected(); });
+```
+
+* **Output widgets** (near your log panel):
+
+```cpp
+QPlainTextEdit* outStdout = new QPlainTextEdit(central);
+QPlainTextEdit* outStderr = new QPlainTextEdit(central);
+outStdout->setReadOnly(true); outStdout->setPlaceholderText("stdout.json");
+outStderr->setReadOnly(true); outStderr->setPlaceholderText("stderr (compiler/runtime)");
+auto outRow = new QHBoxLayout();
+outRow->addWidget(outStdout); outRow->addWidget(outStderr);
+root->addLayout(outRow);
+```
+
+* **Hook implementation**:
+
+```cpp
+void View::showExecResult(const std::string& title,
+                          const std::string& stdout_json,
+                          const std::string& stderr_text,
+                          int exit_code,
+                          const std::filesystem::path& workdir) {
+    appendLog(QString::fromStdString(title + " — exit=" + std::to_string(exit_code) +
+               (workdir.empty()? "" : " — " + workdir.string())));
+    outStdout->setPlainText(QString::fromStdString(stdout_json));
+    outStderr->setPlainText(QString::fromStdString(stderr_text));
+}
+```
+
+* **Selected-row helpers**:
+
+```cpp
+void View::runSelected(){
+    if (!onRunCode){ showStatus("Run not wired"); return; }
+    auto sel = table->selectionModel()->selectedRows();
+    if (sel.isEmpty()){ showStatus("Select a row first."); return; }
+    int row = sel.first().row();
+    long long r=0,a=0;
+    if (!parseIntBase(qToStd(model->index(row,0).data().toString()), cfg.base, r) ||
+        !parseIntBase(qToStd(model->index(row,1).data().toString()), cfg.base, a)) {
+        showStatus("Bad reg/addr"); return;
+    }
+    bool ok=false;
+    QString in = QInputDialog::getMultiLineText(this, "stdin.json", "JSON:", "{}", &ok);
+    if (!ok) return;
+    onRunCode(r, a, qToStd(in));
+}
+
+void View::docCheckSelected(){
+    if (!onDocCheck){ showStatus("Doc check not wired"); return; }
+    auto sel = table->selectionModel()->selectedRows();
+    if (sel.isEmpty()){ showStatus("Select a row first."); return; }
+    int row = sel.first().row();
+    long long r=0,a=0;
+    if (!parseIntBase(qToStd(model->index(row,0).data().toString()), cfg.base, r) ||
+        !parseIntBase(qToStd(model->index(row,1).data().toString()), cfg.base, a)) {
+        showStatus("Bad reg/addr"); return;
+    }
+    onDocCheck(r, a);
+}
+```
+
+> That’s all the Qt glue. Everything else (resolve/export, model, filters) stays as-is.
+
+---
+
+# 3) Build (CLI + Qt)
+
+### Quick one-liners (no CMake)
+
+```bash
+# CLI (adjust sources/headers to your tree)
+g++ -std=c++20 -O2 -pipe -o scripted_cli \
+    scripted.cpp \
+    -I. 
+
+# Qt (Widgets app)
+g++ -std=c++20 -O2 -pipe -o scripted_qt \
+    qt_view.cpp presenter.hpp scripted_core.hpp frontend_contract.hpp \
+    -I. $(pkg-config --cflags --libs Qt6Widgets)
+```
+
+### CMake (optional, nicer)
+
+Create `CMakeLists.txt` at repo root:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(scripted LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+
+add_executable(scripted_cli scripted.cpp)
+target_include_directories(scripted_cli PRIVATE .)
+
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
+qt_standard_project_setup()
+
+add_executable(scripted_qt qt_view.cpp)
+target_include_directories(scripted_qt PRIVATE .)
+target_link_libraries(scripted_qt PRIVATE Qt6::Widgets)
+```
+
+Build:
+
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build -j
+```
+
+Run (WSLg shows the GUI automatically on Win11):
+
+```bash
+./build/scripted_cli
+./build/scripted_qt
+```
+
+---
+
+# 4) Smoke test (end-to-end, from Qt)
+
+1. Insert code into a cell (paste the contents of one example, e.g. `examples/echo.cpp`) so the **value** of that cell begins with the `/*---DOC--- … ---END---*/` block.
+2. Select that row → **Code → Run (stdio-json)…** → enter:
+
+   ```json
+   {"hello":"world"}
+   ```
+3. You should see `stdout.json` fill with the echoed JSON (plus `echoed_by` and `ts`).
+   Open the run folder shown in the status to see `files/out/exec/<object>_<hash>/`.
+
+---
+
+# 5) Handling **complex** projects (no artificial limits)
+
+The exec header accepts whole projects via **resolved text** (your Resolver assembles them in-world). For large builds:
+
+* **C/C++**: put all sources into the resolved text (or `@file(...)` includes); the exec module writes them to a work dir and compiles everything it finds. Provide extra flags via a small banner in the doc (e.g., `-Iinclude -O3 -Wall`).
+* **Java**: set `main` to the fully qualified class, and include packages in the resolved text.
+* **Python**: your main module reads stdin and writes stdout; you can create package files via includes. If you need a venv/requirements, add a prelude section in the code that bootstraps (or we can extend the header to auto-venv—say the word and I’ll ship the patch).
+
+Because compilation happens on disk in a per-run work dir, you’re limited only by the machine—**not** the framework.
+
+---
+
+Want me to generate a **paste-ready cell** that demonstrates a **multi-file C++** project (header + two .cpps) assembled via `@file(...)` and then run from Qt?

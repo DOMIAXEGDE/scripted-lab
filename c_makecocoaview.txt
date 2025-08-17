@@ -1,0 +1,6 @@
+add_executable(scripted_gui cocoa_view.mm)
+target_compile_features(scripted_gui PRIVATE cxx_std_23)
+target_compile_options(scripted_gui PRIVATE -fobjc-arc)
+target_link_libraries(scripted_gui PRIVATE "-framework AppKit" "-framework Foundation")
+# headers are in your source dir:
+target_include_directories(scripted_gui PRIVATE ${CMAKE_SOURCE_DIR})
